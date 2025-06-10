@@ -3,25 +3,31 @@ import json
 import logging
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, asdict
-from flask import Flask, request, jsonify
-from threading import Thread
+from datetime import datetime
+import uuid
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import time
-from datetime import datetime, timedelta
 
-# MCP SDK imports
+from flask import Flask, request, jsonify, Response
+from flask_cors import CORS
+import requests
+
+# MCP imports
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.types import (
+    Tool, 
+    TextContent, 
+    ImageContent, 
+    EmbeddedResource,
     CallToolRequest,
+    CallToolResult,
     ListToolsRequest,
-    GetPromptRequest,
-    ListPromptsRequest,
     ListResourcesRequest,
     ReadResourceRequest,
-    CreateMessageRequest,
-    Tool,
-    Prompt,
-    Resource,
+    GetPromptRequest,
+    ListPromptsRequest
 )
 
 # Configure logging
@@ -29,493 +35,572 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 @dataclass
-class MCPServerConfig:
-    """Configuration for an MCP server"""
+class ServerConfig:
     name: str
     command: str
     args: List[str]
     env: Optional[Dict[str, str]] = None
 
 @dataclass
-class ConversationMessage:
-    """Represents a message in a conversation"""
-    role: str
-    content: str
-    timestamp: datetime
-    tool_calls: Optional[List[Dict]] = None
+class SessionData:
+    session_id: str
+    conversation_history: List[Dict[str, Any]]
+    created_at: datetime
+    last_activity: datetime
 
-class ConversationSession:
-    """Manages conversation state for a session"""
-    def __init__(self, session_id: str):
-        self.session_id = session_id
-        self.messages: List[ConversationMessage] = []
-        self.last_activity = datetime.now()
-        self.context: Dict[str, Any] = {}
-    
-    def add_message(self, role: str, content: str, tool_calls: Optional[List[Dict]] = None):
-        """Add a message to the conversation"""
-        message = ConversationMessage(
-            role=role,
-            content=content,
-            timestamp=datetime.now(),
-            tool_calls=tool_calls
-        )
-        self.messages.append(message)
-        self.last_activity = datetime.now()
-    
-    def get_context(self) -> List[Dict]:
-        """Get conversation context for LLM"""
-        return [
-            {
-                "role": msg.role,
-                "content": msg.content,
-                "tool_calls": msg.tool_calls,
-                "timestamp": msg.timestamp.isoformat()
-            }
-            for msg in self.messages
-        ]
-    
-    def clear_context(self):
-        """Clear conversation context"""
-        self.messages.clear()
-        self.context.clear()
-
-class MCPServerConnection:
-    """Manages connection to a single MCP server"""
-    def __init__(self, config: MCPServerConfig):
-        self.config = config
-        self.session: Optional[ClientSession] = None
-        self.is_connected = False
-        self.tools: List[Tool] = []
-        self.prompts: List[Prompt] = []
-        self.resources: List[Resource] = []
-        self.last_sync = None
-    
-    async def connect(self):
-        """Connect to the MCP server"""
-        try:
-            server_params = StdioServerParameters(
-                command=self.config.command,
-                args=self.config.args,
-                env=self.config.env or {}
-            )
-            
-            self.session = await stdio_client(server_params).__aenter__()
-            self.is_connected = True
-            
-            # Initialize server capabilities
-            await self.sync_capabilities()
-            
-            logger.info(f"Connected to MCP server: {self.config.name}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to connect to MCP server {self.config.name}: {e}")
-            self.is_connected = False
-            return False
-    
-    async def disconnect(self):
-        """Disconnect from the MCP server"""
-        if self.session:
-            try:
-                await self.session.__aexit__(None, None, None)
-            except Exception as e:
-                logger.error(f"Error disconnecting from {self.config.name}: {e}")
-            finally:
-                self.session = None
-                self.is_connected = False
-    
-    async def sync_capabilities(self):
-        """Sync server capabilities (tools, prompts, resources)"""
-        if not self.session:
-            return
-        
-        try:
-            # List tools
-            tools_response = await self.session.list_tools(ListToolsRequest())
-            self.tools = tools_response.tools
-            
-            # List prompts
-            try:
-                prompts_response = await self.session.list_prompts(ListPromptsRequest())
-                self.prompts = prompts_response.prompts
-            except Exception:
-                self.prompts = []  # Server might not support prompts
-            
-            # List resources
-            try:
-                resources_response = await self.session.list_resources(ListResourcesRequest())
-                self.resources = resources_response.resources
-            except Exception:
-                self.resources = []  # Server might not support resources
-            
-            self.last_sync = datetime.now()
-            logger.info(f"Synced capabilities for {self.config.name}: "
-                       f"{len(self.tools)} tools, {len(self.prompts)} prompts, "
-                       f"{len(self.resources)} resources")
-            
-        except Exception as e:
-            logger.error(f"Failed to sync capabilities for {self.config.name}: {e}")
-    
-    async def call_tool(self, tool_name: str, arguments: Dict) -> Dict:
-        """Call a tool on this server"""
-        if not self.session or not self.is_connected:
-            raise Exception(f"Not connected to server {self.config.name}")
-        
-        try:
-            request = CallToolRequest(name=tool_name, arguments=arguments)
-            response = await self.session.call_tool(request)
-            return {
-                "success": True,
-                "content": response.content,
-                "server": self.config.name
-            }
-        except Exception as e:
-            logger.error(f"Tool call failed on {self.config.name}: {e}")
-            return {
-                "success": False,
-                "error": str(e),
-                "server": self.config.name
-            }
+@dataclass
+class MCPConnection:
+    name: str
+    session: ClientSession
+    tools: List[Tool]
+    resources: List[Any]
+    prompts: List[Any]
+    is_connected: bool = False
 
 class MCPClientManager:
-    """Manages multiple MCP server connections and sessions"""
     def __init__(self):
-        self.servers: Dict[str, MCPServerConnection] = {}
-        self.sessions: Dict[str, ConversationSession] = {}
-        self.loop = None
-        self.background_thread = None
-        self.running = False
+        self.connections: Dict[str, MCPConnection] = {}
+        self.sessions: Dict[str, SessionData] = {}
+        self.executor = ThreadPoolExecutor(max_workers=10)
+        self.event_queues: Dict[str, List[Dict]] = {}
         
-        # Session cleanup settings
-        self.session_timeout = timedelta(hours=2)
-        self.cleanup_interval = 300  # 5 minutes
-    
-    def start_background_loop(self):
-        """Start the background asyncio loop"""
-        if self.background_thread and self.background_thread.is_alive():
-            return
-        
-        self.running = True
-        self.background_thread = Thread(target=self._run_background_loop, daemon=True)
-        self.background_thread.start()
-        
-        # Wait for loop to be ready
-        while self.loop is None:
-            time.sleep(0.1)
-    
-    def _run_background_loop(self):
-        """Run the background asyncio loop"""
-        self.loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self.loop)
-        
-        # Schedule periodic cleanup
-        self.loop.create_task(self._periodic_cleanup())
-        
-        self.loop.run_forever()
-    
-    async def _periodic_cleanup(self):
-        """Periodic cleanup of expired sessions"""
-        while self.running:
-            await asyncio.sleep(self.cleanup_interval)
-            await self._cleanup_expired_sessions()
-    
-    async def _cleanup_expired_sessions(self):
-        """Clean up expired sessions"""
-        now = datetime.now()
-        expired_sessions = [
-            session_id for session_id, session in self.sessions.items()
-            if now - session.last_activity > self.session_timeout
-        ]
-        
-        for session_id in expired_sessions:
-            del self.sessions[session_id]
-            logger.info(f"Cleaned up expired session: {session_id}")
-    
-    def run_async(self, coro):
-        """Run an async function in the background loop"""
-        if not self.loop:
-            self.start_background_loop()
-        
-        future = asyncio.run_coroutine_threadsafe(coro, self.loop)
-        return future.result(timeout=30)  # 30 second timeout
-    
-    def add_server(self, config: MCPServerConfig) -> bool:
+    async def add_server(self, config: ServerConfig) -> bool:
         """Add and connect to an MCP server"""
-        if config.name in self.servers:
-            logger.warning(f"Server {config.name} already exists")
-            return False
-        
-        connection = MCPServerConnection(config)
-        success = self.run_async(connection.connect())
-        
-        if success:
-            self.servers[config.name] = connection
-            logger.info(f"Added MCP server: {config.name}")
-            return True
-        
-        return False
-    
-    def remove_server(self, server_name: str) -> bool:
-        """Remove and disconnect from an MCP server"""
-        if server_name not in self.servers:
-            return False
-        
-        connection = self.servers[server_name]
-        self.run_async(connection.disconnect())
-        del self.servers[server_name]
-        
-        logger.info(f"Removed MCP server: {server_name}")
-        return True
-    
-    def get_session(self, session_id: str) -> ConversationSession:
-        """Get or create a conversation session"""
-        if session_id not in self.sessions:
-            self.sessions[session_id] = ConversationSession(session_id)
-        
-        session = self.sessions[session_id]
-        session.last_activity = datetime.now()
-        return session
-    
-    def get_all_tools(self) -> Dict[str, List[Dict]]:
-        """Get all available tools from all servers"""
-        all_tools = {}
-        for server_name, connection in self.servers.items():
-            if connection.is_connected:
-                all_tools[server_name] = [
-                    {
-                        "name": tool.name,
-                        "description": tool.description,
-                        "inputSchema": tool.inputSchema
-                    }
-                    for tool in connection.tools
-                ]
-        return all_tools
-    
-    def call_tool(self, tool_name: str, arguments: Dict, server_name: Optional[str] = None) -> Dict:
-        """Call a tool on a specific server or find it automatically"""
-        if server_name:
-            # Call on specific server
-            if server_name not in self.servers:
-                return {"success": False, "error": f"Server {server_name} not found"}
+        try:
+            # Create server parameters
+            server_params = StdioServerParameters(
+                command=config.command,
+                args=config.args,
+                env=config.env or {}
+            )
             
-            connection = self.servers[server_name]
-            return self.run_async(connection.call_tool(tool_name, arguments))
-        
-        # Find tool across all servers
-        for server_name, connection in self.servers.items():
-            if connection.is_connected:
-                tool_names = [tool.name for tool in connection.tools]
-                if tool_name in tool_names:
-                    return self.run_async(connection.call_tool(tool_name, arguments))
-        
-        return {"success": False, "error": f"Tool {tool_name} not found on any server"}
+            # Create stdio client
+            stdio_transport = stdio_client(server_params)
+            
+            # Create session
+            async with stdio_transport as (read, write):
+                session = ClientSession(read, write)
+                
+                # Initialize the session
+                await session.initialize()
+                
+                # Get available tools
+                tools_response = await session.call_tool(ListToolsRequest())
+                tools = tools_response.tools if hasattr(tools_response, 'tools') else []
+                
+                # Get available resources
+                try:
+                    resources_response = await session.call_tool(ListResourcesRequest())
+                    resources = resources_response.resources if hasattr(resources_response, 'resources') else []
+                except:
+                    resources = []
+                
+                # Get available prompts
+                try:
+                    prompts_response = await session.call_tool(ListPromptsRequest())
+                    prompts = prompts_response.prompts if hasattr(prompts_response, 'prompts') else []
+                except:
+                    prompts = []
+                
+                # Store connection
+                self.connections[config.name] = MCPConnection(
+                    name=config.name,
+                    session=session,
+                    tools=tools,
+                    resources=resources,
+                    prompts=prompts,
+                    is_connected=True
+                )
+                
+                logger.info(f"Successfully connected to MCP server: {config.name}")
+                return True
+                
+        except Exception as e:
+            logger.error(f"Failed to connect to MCP server {config.name}: {str(e)}")
+            return False
     
-    def get_server_status(self) -> Dict[str, Dict]:
-        """Get status of all servers"""
-        status = {}
-        for server_name, connection in self.servers.items():
-            status[server_name] = {
-                "connected": connection.is_connected,
-                "tools_count": len(connection.tools),
-                "prompts_count": len(connection.prompts),
-                "resources_count": len(connection.resources),
-                "last_sync": connection.last_sync.isoformat() if connection.last_sync else None
+    async def call_tool(self, server_name: str, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Call a tool on a specific MCP server"""
+        if server_name not in self.connections:
+            raise ValueError(f"Server {server_name} not found")
+        
+        connection = self.connections[server_name]
+        if not connection.is_connected:
+            raise ValueError(f"Server {server_name} is not connected")
+        
+        try:
+            # Create tool call request
+            request = CallToolRequest(
+                name=tool_name,
+                arguments=arguments
+            )
+            
+            # Call the tool
+            result = await connection.session.call_tool(request)
+            
+            # Process result
+            if hasattr(result, 'content'):
+                return {
+                    'success': True,
+                    'content': [self._process_content(content) for content in result.content],
+                    'is_error': getattr(result, 'isError', False)
+                }
+            else:
+                return {
+                    'success': True,
+                    'result': str(result),
+                    'is_error': False
+                }
+                
+        except Exception as e:
+            logger.error(f"Tool call failed: {str(e)}")
+            return {
+                'success': False,
+                'error': str(e),
+                'is_error': True
             }
-        return status
+    
+    def _process_content(self, content) -> Dict[str, Any]:
+        """Process content from MCP response"""
+        if isinstance(content, TextContent):
+            return {
+                'type': 'text',
+                'text': content.text
+            }
+        elif isinstance(content, ImageContent):
+            return {
+                'type': 'image',
+                'data': content.data,
+                'mimeType': content.mimeType
+            }
+        elif isinstance(content, EmbeddedResource):
+            return {
+                'type': 'resource',
+                'resource': asdict(content)
+            }
+        else:
+            return {
+                'type': 'unknown',
+                'data': str(content)
+            }
+    
+    def get_session(self, session_id: str) -> SessionData:
+        """Get or create a session"""
+        if session_id not in self.sessions:
+            self.sessions[session_id] = SessionData(
+                session_id=session_id,
+                conversation_history=[],
+                created_at=datetime.now(),
+                last_activity=datetime.now()
+            )
+        else:
+            self.sessions[session_id].last_activity = datetime.now()
+        
+        return self.sessions[session_id]
+    
+    def add_to_conversation(self, session_id: str, message: Dict[str, Any]):
+        """Add message to conversation history"""
+        session = self.get_session(session_id)
+        session.conversation_history.append({
+            **message,
+            'timestamp': datetime.now().isoformat()
+        })
+    
+    def add_event(self, session_id: str, event: Dict[str, Any]):
+        """Add event to session queue for SSE"""
+        if session_id not in self.event_queues:
+            self.event_queues[session_id] = []
+        
+        self.event_queues[session_id].append({
+            **event,
+            'timestamp': datetime.now().isoformat(),
+            'id': str(uuid.uuid4())
+        })
+    
+    def get_events(self, session_id: str) -> List[Dict[str, Any]]:
+        """Get and clear events for session"""
+        events = self.event_queues.get(session_id, [])
+        self.event_queues[session_id] = []
+        return events
+    
+    async def process_query(self, session_id: str, query: str, llm_api_url: str, llm_headers: Dict[str, str]) -> Dict[str, Any]:
+        """Process a query using available tools and LLM"""
+        
+        # Add user query to conversation
+        self.add_to_conversation(session_id, {
+            'role': 'user',
+            'content': query
+        })
+        
+        # Send event that we're processing
+        self.add_event(session_id, {
+            'type': 'processing',
+            'message': 'Processing your query...'
+        })
+        
+        # Get available tools from all servers
+        available_tools = []
+        for server_name, connection in self.connections.items():
+            if connection.is_connected:
+                for tool in connection.tools:
+                    available_tools.append({
+                        'server': server_name,
+                        'name': tool.name,
+                        'description': tool.description,
+                        'inputSchema': tool.inputSchema
+                    })
+        
+        # Get conversation history
+        session = self.get_session(session_id)
+        conversation_history = session.conversation_history[-10:]  # Last 10 messages
+        
+        # Prepare LLM request with tools
+        llm_request = {
+            'model': 'gpt-4',  # Adjust based on your LLM
+            'messages': [
+                {
+                    'role': 'system',
+                    'content': f"""You are an AI assistant with access to MCP tools. 
+                    Available tools: {json.dumps(available_tools, indent=2)}
+                    
+                    When you need to use a tool, respond with a JSON object in this format:
+                    {{
+                        "action": "tool_call",
+                        "server": "server_name",
+                        "tool": "tool_name",
+                        "arguments": {{...}}
+                    }}
+                    
+                    Otherwise, respond normally to answer the user's query."""
+                }
+            ] + [
+                {'role': msg['role'], 'content': msg['content']} 
+                for msg in conversation_history
+            ],
+            'temperature': 0.7,
+            'max_tokens': 1000
+        }
+        
+        try:
+            # Call LLM
+            self.add_event(session_id, {
+                'type': 'llm_call',
+                'message': 'Calling LLM to analyze query...'
+            })
+            
+            llm_response = requests.post(
+                llm_api_url,
+                headers=llm_headers,
+                json=llm_request,
+                timeout=30
+            )
+            
+            if llm_response.status_code != 200:
+                raise Exception(f"LLM API error: {llm_response.status_code}")
+            
+            llm_result = llm_response.json()
+            assistant_message = llm_result['choices'][0]['message']['content']
+            
+            # Check if LLM wants to call a tool
+            try:
+                tool_call = json.loads(assistant_message)
+                if tool_call.get('action') == 'tool_call':
+                    # Execute tool call
+                    self.add_event(session_id, {
+                        'type': 'tool_call',
+                        'message': f'Calling tool: {tool_call["tool"]} on server: {tool_call["server"]}'
+                    })
+                    
+                    tool_result = await self.call_tool(
+                        tool_call['server'],
+                        tool_call['tool'],
+                        tool_call['arguments']
+                    )
+                    
+                    self.add_event(session_id, {
+                        'type': 'tool_result',
+                        'message': 'Tool execution completed'
+                    })
+                    
+                    # Add tool result to conversation and get final response
+                    tool_context = f"Tool call result: {json.dumps(tool_result, indent=2)}"
+                    
+                    # Get final response from LLM
+                    final_request = {
+                        'model': 'gpt-4',
+                        'messages': llm_request['messages'] + [
+                            {'role': 'assistant', 'content': f'I need to call tool: {tool_call["tool"]}'},
+                            {'role': 'system', 'content': tool_context},
+                            {'role': 'user', 'content': 'Based on this tool result, please provide a comprehensive answer to my original query.'}
+                        ],
+                        'temperature': 0.7,
+                        'max_tokens': 1000
+                    }
+                    
+                    final_response = requests.post(
+                        llm_api_url,
+                        headers=llm_headers,
+                        json=final_request,
+                        timeout=30
+                    )
+                    
+                    if final_response.status_code == 200:
+                        final_result = final_response.json()
+                        assistant_message = final_result['choices'][0]['message']['content']
+                    
+                    # Add tool call info to response
+                    response_data = {
+                        'response': assistant_message,
+                        'tool_used': {
+                            'server': tool_call['server'],
+                            'tool': tool_call['tool'],
+                            'arguments': tool_call['arguments'],
+                            'result': tool_result
+                        }
+                    }
+                else:
+                    response_data = {'response': assistant_message}
+            except json.JSONDecodeError:
+                # Normal text response
+                response_data = {'response': assistant_message}
+            
+            # Add assistant response to conversation
+            self.add_to_conversation(session_id, {
+                'role': 'assistant',
+                'content': assistant_message
+            })
+            
+            self.add_event(session_id, {
+                'type': 'response_ready',
+                'message': 'Response generated successfully'
+            })
+            
+            return {
+                'success': True,
+                'session_id': session_id,
+                **response_data
+            }
+            
+        except Exception as e:
+            error_msg = f"Error processing query: {str(e)}"
+            logger.error(error_msg)
+            
+            self.add_event(session_id, {
+                'type': 'error',
+                'message': error_msg
+            })
+            
+            return {
+                'success': False,
+                'error': error_msg,
+                'session_id': session_id
+            }
 
-# Initialize the MCP client manager
+# Initialize MCP client manager
 mcp_manager = MCPClientManager()
 
-# Flask application
+# Create Flask app
 app = Flask(__name__)
+CORS(app)
 
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
     return jsonify({
-        "status": "healthy",
-        "servers": len(mcp_manager.servers),
-        "active_sessions": len(mcp_manager.sessions)
+        'status': 'healthy',
+        'servers': {
+            name: conn.is_connected 
+            for name, conn in mcp_manager.connections.items()
+        }
     })
-
-@app.route('/servers', methods=['GET'])
-def list_servers():
-    """List all MCP servers"""
-    return jsonify(mcp_manager.get_server_status())
 
 @app.route('/servers', methods=['POST'])
 def add_server():
     """Add a new MCP server"""
-    data = request.get_json()
-    
-    if not data or 'name' not in data or 'command' not in data:
-        return jsonify({"error": "Missing required fields: name, command"}), 400
-    
-    config = MCPServerConfig(
-        name=data['name'],
-        command=data['command'],
-        args=data.get('args', []),
-        env=data.get('env')
-    )
-    
-    success = mcp_manager.add_server(config)
-    
-    if success:
-        return jsonify({"message": f"Server {config.name} added successfully"})
-    else:
-        return jsonify({"error": f"Failed to add server {config.name}"}), 500
-
-@app.route('/servers/<server_name>', methods=['DELETE'])
-def remove_server(server_name):
-    """Remove an MCP server"""
-    success = mcp_manager.remove_server(server_name)
-    
-    if success:
-        return jsonify({"message": f"Server {server_name} removed successfully"})
-    else:
-        return jsonify({"error": f"Server {server_name} not found"}), 404
-
-@app.route('/tools', methods=['GET'])
-def list_tools():
-    """List all available tools"""
-    return jsonify(mcp_manager.get_all_tools())
-
-@app.route('/tools/call', methods=['POST'])
-def call_tool():
-    """Call a tool"""
-    data = request.get_json()
-    
-    if not data or 'tool_name' not in data:
-        return jsonify({"error": "Missing required field: tool_name"}), 400
-    
-    tool_name = data['tool_name']
-    arguments = data.get('arguments', {})
-    server_name = data.get('server_name')
-    session_id = data.get('session_id')
-    
-    # Call the tool
-    result = mcp_manager.call_tool(tool_name, arguments, server_name)
-    
-    # If session_id provided, add to conversation context
-    if session_id:
-        session = mcp_manager.get_session(session_id)
-        session.add_message(
-            role="assistant",
-            content=f"Called tool {tool_name}",
-            tool_calls=[{
-                "tool_name": tool_name,
-                "arguments": arguments,
-                "result": result
-            }]
+    try:
+        data = request.json
+        config = ServerConfig(
+            name=data['name'],
+            command=data['command'],
+            args=data.get('args', []),
+            env=data.get('env')
         )
-    
-    return jsonify(result)
+        
+        # Run in executor to avoid blocking
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        success = loop.run_until_complete(mcp_manager.add_server(config))
+        loop.close()
+        
+        if success:
+            return jsonify({
+                'success': True,
+                'message': f'Server {config.name} added successfully'
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'error': f'Failed to connect to server {config.name}'
+            }), 400
+            
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 400
 
-@app.route('/sessions/<session_id>/messages', methods=['GET'])
-def get_session_messages(session_id):
-    """Get conversation messages for a session"""
+@app.route('/servers', methods=['GET'])
+def list_servers():
+    """List all connected servers and their capabilities"""
+    servers = {}
+    for name, conn in mcp_manager.connections.items():
+        servers[name] = {
+            'is_connected': conn.is_connected,
+            'tools': [
+                {
+                    'name': tool.name,
+                    'description': tool.description,
+                    'inputSchema': tool.inputSchema
+                }
+                for tool in conn.tools
+            ],
+            'resources': len(conn.resources),
+            'prompts': len(conn.prompts)
+        }
+    
+    return jsonify({'servers': servers})
+
+@app.route('/query', methods=['POST'])
+def process_query():
+    """Process a query using MCP tools and LLM"""
+    try:
+        data = request.json
+        query = data.get('query', '')
+        session_id = data.get('session_id', str(uuid.uuid4()))
+        llm_api_url = data.get('llm_api_url', 'https://api.openai.com/v1/chat/completions')
+        llm_headers = data.get('llm_headers', {})
+        
+        if not query:
+            return jsonify({
+                'success': False,
+                'error': 'Query is required'
+            }), 400
+        
+        # Process query asynchronously
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        result = loop.run_until_complete(
+            mcp_manager.process_query(session_id, query, llm_api_url, llm_headers)
+        )
+        loop.close()
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 400
+
+@app.route('/events/<session_id>')
+def stream_events(session_id):
+    """Server-Sent Events endpoint for real-time updates"""
+    def event_stream():
+        while True:
+            events = mcp_manager.get_events(session_id)
+            for event in events:
+                yield f"data: {json.dumps(event)}\n\n"
+            time.sleep(0.5)  # Poll every 500ms
+    
+    return Response(
+        event_stream(),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Headers': 'Cache-Control'
+        }
+    )
+
+@app.route('/sessions/<session_id>/history', methods=['GET'])
+def get_conversation_history(session_id):
+    """Get conversation history for a session"""
     session = mcp_manager.get_session(session_id)
     return jsonify({
-        "session_id": session_id,
-        "messages": session.get_context()
+        'session_id': session_id,
+        'history': session.conversation_history,
+        'created_at': session.created_at.isoformat(),
+        'last_activity': session.last_activity.isoformat()
     })
-
-@app.route('/sessions/<session_id>/messages', methods=['POST'])
-def add_session_message(session_id):
-    """Add a message to a session"""
-    data = request.get_json()
-    
-    if not data or 'role' not in data or 'content' not in data:
-        return jsonify({"error": "Missing required fields: role, content"}), 400
-    
-    session = mcp_manager.get_session(session_id)
-    session.add_message(
-        role=data['role'],
-        content=data['content'],
-        tool_calls=data.get('tool_calls')
-    )
-    
-    return jsonify({"message": "Message added successfully"})
-
-@app.route('/sessions/<session_id>/clear', methods=['POST'])
-def clear_session(session_id):
-    """Clear a session's conversation context"""
-    session = mcp_manager.get_session(session_id)
-    session.clear_context()
-    
-    return jsonify({"message": "Session cleared successfully"})
 
 @app.route('/sessions', methods=['GET'])
 def list_sessions():
     """List all active sessions"""
-    sessions_info = {}
+    sessions = {}
     for session_id, session in mcp_manager.sessions.items():
-        sessions_info[session_id] = {
-            "message_count": len(session.messages),
-            "last_activity": session.last_activity.isoformat()
+        sessions[session_id] = {
+            'created_at': session.created_at.isoformat(),
+            'last_activity': session.last_activity.isoformat(),
+            'message_count': len(session.conversation_history)
         }
     
-    return jsonify(sessions_info)
+    return jsonify({'sessions': sessions})
 
-@app.route('/chat', methods=['POST'])
-def chat():
-    """Main chat endpoint that handles conversation with tool calling"""
-    data = request.get_json()
-    
-    if not data or 'message' not in data or 'session_id' not in data:
-        return jsonify({"error": "Missing required fields: message, session_id"}), 400
-    
-    session_id = data['session_id']
-    message = data['message']
-    
-    # Get session
-    session = mcp_manager.get_session(session_id)
-    
-    # Add user message
-    session.add_message(role="user", content=message)
-    
-    # Get conversation context
-    context = session.get_context()
-    
-    # Get available tools
-    available_tools = mcp_manager.get_all_tools()
-    
-    return jsonify({
-        "session_id": session_id,
-        "context": context,
-        "available_tools": available_tools,
-        "message": "Context updated. Use available tools and LLM to generate response."
-    })
+@app.route('/tools/call', methods=['POST'])
+def call_tool_direct():
+    """Direct tool call endpoint"""
+    try:
+        data = request.json
+        server_name = data.get('server')
+        tool_name = data.get('tool')
+        arguments = data.get('arguments', {})
+        
+        if not server_name or not tool_name:
+            return jsonify({
+                'success': False,
+                'error': 'Server and tool name are required'
+            }), 400
+        
+        # Call tool
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        result = loop.run_until_complete(
+            mcp_manager.call_tool(server_name, tool_name, arguments)
+        )
+        loop.close()
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 400
 
 if __name__ == '__main__':
-    # Example of adding servers on startup
+    # Example server configurations
     example_servers = [
         {
-            "name": "filesystem",
-            "command": "npx",
-            "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+            'name': 'filesystem',
+            'command': 'mcp-server-filesystem',
+            'args': ['--root', '/tmp']
         },
         {
-            "name": "brave-search",
-            "command": "npx",
-            "args": ["-y", "@modelcontextprotocol/server-brave-search"],
-            "env": {"BRAVE_API_KEY": "your-api-key-here"}
+            'name': 'git',
+            'command': 'mcp-server-git',
+            'args': []
         }
     ]
     
-    # Start the background loop
-    mcp_manager.start_background_loop()
+    print("MCP Client Flask API starting...")
+    print("Available endpoints:")
+    print("  POST /servers - Add MCP server")
+    print("  GET /servers - List servers")
+    print("  POST /query - Process query with tools")
+    print("  GET /events/<session_id> - SSE stream")
+    print("  GET /sessions/<session_id>/history - Get conversation history")
+    print("  POST /tools/call - Direct tool call")
+    print("  GET /health - Health check")
     
-    # Add example servers
-    for server_config in example_servers:
-        config = MCPServerConfig(
-            name=server_config["name"],
-            command=server_config["command"],
-            args=server_config["args"],
-            env=server_config.get("env")
-        )
-        mcp_manager.add_server(config)
-    
-    # Run Flask app
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    app.run(debug=True, host='0.0.0.0', port=5000, threaded=True)
